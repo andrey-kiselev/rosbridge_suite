@@ -211,7 +211,7 @@ if __name__ == "__main__":
                 application.listen(port, address, ssl_options={ "certfile": certfile, "keyfile": keyfile})
             else:
                 application.listen(port, address)
-            rospy.loginfo("Rosbridge WebSocket server started on port %d", port)
+            rospy.loginfo("[AMICI] Rosbridge WebSocket server started on port %d", port)
             connected = True
         except error as e:
             rospy.logwarn("Unable to start server: " + str(e) +

@@ -10,12 +10,12 @@ unfinished callbacks on the event loop that fail when it resumes)
 """
 
 from __future__ import absolute_import, division, print_function, with_statement
-import datetime
 import functools
 
+import tornado.concurrent
+from tornado.gen import convert_yielded
 from tornado.ioloop import IOLoop
 from tornado import stack_context
-from tornado.util import timedelta_to_seconds
 
 try:
     # Import the real asyncio module for py33+ first.  Older versions of the
@@ -140,3 +140,18 @@ class AsyncIOLoop(BaseAsyncIOLoop):
     def initialize(self):
         super(AsyncIOLoop, self).initialize(asyncio.new_event_loop(),
                                             close_loop=True)
+
+def to_tornado_future(asyncio_future):
+    """Convert an ``asyncio.Future`` to a `tornado.concurrent.Future`."""
+    tf = tornado.concurrent.Future()
+    tornado.concurrent.chain_future(asyncio_future, tf)
+    return tf
+
+def to_asyncio_future(tornado_future):
+    """Convert a `tornado.concurrent.Future` to an ``asyncio.Future``."""
+    af = asyncio.Future()
+    tornado.concurrent.chain_future(tornado_future, af)
+    return af
+
+if hasattr(convert_yielded, 'register'):
+    convert_yielded.register(asyncio.Future, to_tornado_future)

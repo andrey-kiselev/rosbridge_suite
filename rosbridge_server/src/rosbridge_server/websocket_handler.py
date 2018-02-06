@@ -111,7 +111,20 @@ class RosbridgeWebSocket(WebSocketHandler):
 
     def send_message(self, message):
         binary = type(message)==bson.BSON
+        rospy.loginfo("Sending message")
         IOLoop.instance().add_callback(partial(self.write_message, message, binary))
 
     def check_origin(self, origin):
         return True
+
+    def get_compression_options(self):
+        """Override to return compression options for the connection.
+        If this method returns None (the default), compression will
+        be disabled.  If it returns a dict (even an empty one), it
+        will be enabled.  The contents of the dict may be used to
+        control the memory and CPU usage of the compression,
+        but no such options are currently implemented.
+        .. versionadded:: 4.1
+        """
+        #return None
+        return dict()

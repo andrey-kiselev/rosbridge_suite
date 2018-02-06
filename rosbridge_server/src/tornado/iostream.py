@@ -39,7 +39,7 @@ from tornado import ioloop
 from tornado.log import gen_log, app_log
 from tornado.netutil import ssl_wrap_socket, ssl_match_hostname, SSLCertificateError
 from tornado import stack_context
-from tornado.util import bytes_type, errno_from_exception
+from tornado.util import errno_from_exception
 
 try:
     from tornado.platform.posix import _set_nonblocking
@@ -67,6 +67,14 @@ _ERRNO_CONNRESET = (errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE,
 
 if hasattr(errno, "WSAECONNRESET"):
     _ERRNO_CONNRESET += (errno.WSAECONNRESET, errno.WSAECONNABORTED, errno.WSAETIMEDOUT)
+
+if sys.platform == 'darwin':
+    # OSX appears to have a race condition that causes send(2) to return
+    # EPROTOTYPE if called while a socket is being torn down:
+    # http://erickt.github.io/blog/2014/11/19/adventures-in-debugging-a-potential-osx-kernel-bug/
+    # Since the socket is being closed anyway, treat this as an ECONNRESET
+    # instead of an unexpected error.
+    _ERRNO_CONNRESET += (errno.EPROTOTYPE,)
 
 # More non-portable errnos:
 _ERRNO_INPROGRESS = (errno.EINPROGRESS,)
@@ -122,6 +130,7 @@ class BaseIOStream(object):
         """`BaseIOStream` constructor.
 
         :arg io_loop: The `.IOLoop` to use; defaults to `.IOLoop.current`.
+                      Deprecated since Tornado 4.1.
         :arg max_buffer_size: Maximum amount of incoming data to buffer;
             defaults to 100MB.
         :arg read_chunk_size: Amount of data to read at one time from the
@@ -230,6 +239,12 @@ class BaseIOStream(object):
             gen_log.info("Unsatisfiable read, closing connection: %s" % e)
             self.close(exc_info=True)
             return future
+        except:
+            if future is not None:
+                # Ensure that the future doesn't log an error because its
+                # failure was never examined.
+                future.add_done_callback(lambda f: f.exception())
+            raise
         return future
 
     def read_until(self, delimiter, callback=None, max_bytes=None):
@@ -257,6 +272,10 @@ class BaseIOStream(object):
             gen_log.info("Unsatisfiable read, closing connection: %s" % e)
             self.close(exc_info=True)
             return future
+        except:
+            if future is not None:
+                future.add_done_callback(lambda f: f.exception())
+            raise
         return future
 
     def read_bytes(self, num_bytes, callback=None, streaming_callback=None,
@@ -281,7 +300,12 @@ class BaseIOStream(object):
         self._read_bytes = num_bytes
         self._read_partial = partial
         self._streaming_callback = stack_context.wrap(streaming_callback)
-        self._try_inline_read()
+        try:
+            self._try_inline_read()
+        except:
+            if future is not None:
+                future.add_done_callback(lambda f: f.exception())
+            raise
         return future
 
     def read_until_close(self, callback=None, streaming_callback=None):
@@ -305,7 +329,11 @@ class BaseIOStream(object):
             self._run_read_callback(self._read_buffer_size, False)
             return future
         self._read_until_close = True
-        self._try_inline_read()
+        try:
+            self._try_inline_read()
+        except:
+            future.add_done_callback(lambda f: f.exception())
+            raise
         return future
 
     def write(self, data, callback=None):
@@ -324,14 +352,14 @@ class BaseIOStream(object):
         .. versionchanged:: 4.0
             Now returns a `.Future` if no callback is given.
         """
-        assert isinstance(data, bytes_type)
+        assert isinstance(data, bytes)
         self._check_closed()
         # We use bool(_write_buffer) as a proxy for write_buffer_size>0,
         # so never put empty strings in the buffer.
         if data:
             if (self.max_write_buffer_size is not None and
                     self._write_buffer_size + len(data) > self.max_write_buffer_size):
-                raise StreamBufferFullError("Reached maximum read buffer size")
+                raise StreamBufferFullError("Reached maximum write buffer size")
             # Break up large contiguous strings before inserting them in the
             # write buffer, so we don't have to recopy the entire thing
             # as we slice off pieces to send to the socket.
@@ -344,6 +372,7 @@ class BaseIOStream(object):
             future = None
         else:
             future = self._write_future = TracebackFuture()
+            future.add_done_callback(lambda f: f.exception())
         if not self._connecting:
             self._handle_write()
             if self._write_buffer:
@@ -554,7 +583,7 @@ class BaseIOStream(object):
             # Pretend to have a pending callback so that an EOF in
             # _read_to_buffer doesn't trigger an immediate close
             # callback.  At the end of this method we'll either
-            # estabilsh a real pending callback via
+            # establish a real pending callback via
             # _read_from_buffer or run the close callback.
             #
             # We need two try statements here so that
@@ -1010,8 +1039,9 @@ class IOStream(BaseIOStream):
             # reported later in _handle_connect.
             if (errno_from_exception(e) not in _ERRNO_INPROGRESS and
                     errno_from_exception(e) not in _ERRNO_WOULDBLOCK):
-                gen_log.warning("Connect error on fd %s: %s",
-                                self.socket.fileno(), e)
+                if future is None:
+                    gen_log.warning("Connect error on fd %s: %s",
+                                    self.socket.fileno(), e)
                 self.close(exc_info=True)
                 return future
         self._add_io_state(self.io_loop.WRITE)
@@ -1058,7 +1088,9 @@ class IOStream(BaseIOStream):
         socket = self.socket
         self.io_loop.remove_handler(socket)
         self.socket = None
-        socket = ssl_wrap_socket(socket, ssl_options, server_side=server_side,
+        socket = ssl_wrap_socket(socket, ssl_options,
+                                 server_hostname=server_hostname,
+                                 server_side=server_side,
                                  do_handshake_on_connect=False)
         orig_close_callback = self._close_callback
         self._close_callback = None
@@ -1185,8 +1217,14 @@ class SSLIOStream(IOStream):
                 return self.close(exc_info=True)
             raise
         except socket.error as err:
-            if err.args[0] in _ERRNO_CONNRESET:
+            # Some port scans (e.g. nmap in -sT mode) have been known
+            # to cause do_handshake to raise EBADF, so make that error
+            # quiet as well.
+            # https://groups.google.com/forum/?fromgroups#!topic/python-tornado/ApucKJat1_0
+            if (err.args[0] in _ERRNO_CONNRESET or
+                err.args[0] == errno.EBADF):
                 return self.close(exc_info=True)
+            raise
         except AttributeError:
             # On Linux, if the connection was reset before the call to
             # wrap_socket, do_handshake will fail with an
