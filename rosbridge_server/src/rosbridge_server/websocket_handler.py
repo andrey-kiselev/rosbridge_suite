@@ -111,7 +111,7 @@ class RosbridgeWebSocket(WebSocketHandler):
 
     def send_message(self, message):
         binary = type(message)==bson.BSON
-        rospy.loginfo("Sending message")
+        #rospy.loginfo("Sending message")
         IOLoop.instance().add_callback(partial(self.write_message, message, binary))
 
     def check_origin(self, origin):
